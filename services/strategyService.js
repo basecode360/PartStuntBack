@@ -226,15 +226,32 @@ export async function applyStrategyToItems(idOrStrategyId, items) {
             (!item.sku || entry.sku === item.sku)
           )
       );
-      // Add new entry with per-listing min/max
+      // Add new entry without min/max pricing
       strategy.appliesTo.push({
         itemId: item.itemId,
         sku: item.sku || null,
         title: item.title || null,
         dateApplied: new Date(),
-        minPrice: item.minPrice !== undefined ? item.minPrice : null,
-        maxPrice: item.maxPrice !== undefined ? item.maxPrice : null,
       });
+
+      // Update listing specific pricing in Product collection
+      const { default: Product } = await import('../models/Product.js');
+      await Product.findOneAndUpdate(
+        { itemId: item.itemId },
+        {
+          $set: {
+            minPrice:
+              item.minPrice !== undefined && item.minPrice !== null
+                ? parseFloat(item.minPrice)
+                : null,
+            maxPrice:
+              item.maxPrice !== undefined && item.maxPrice !== null
+                ? parseFloat(item.maxPrice)
+                : null,
+          },
+        },
+        { new: true }
+      );
       results.push({
         success: true,
         itemId: item.itemId,
@@ -320,16 +337,22 @@ export async function getActiveStrategies() {
  * @param {Number} competitorPrice - The lowest competitor price
  * @param {Number} currentPrice - Current product price
  */
-function calculateNewPrice(strategy, competitorPrice, currentPrice) {
+function calculateNewPrice(
+  strategy,
+  competitorPrice,
+  currentPrice,
+  listingMinPrice = null,
+  listingMaxPrice = null
+) {
   let newPrice = currentPrice;
 
   // Handle case where no competitor price is available
   if (!competitorPrice || competitorPrice <= 0) {
     switch (strategy.noCompetitionAction) {
       case 'USE_MAX_PRICE':
-        return strategy.maxPrice || currentPrice;
+        return listingMaxPrice ?? currentPrice;
       case 'USE_MIN_PRICE':
-        return strategy.minPrice || currentPrice;
+        return listingMinPrice ?? currentPrice;
       case 'KEEP_CURRENT':
       default:
         return currentPrice;
@@ -365,24 +388,28 @@ function calculateNewPrice(strategy, competitorPrice, currentPrice) {
       newPrice = currentPrice;
   }
 
-  // Apply min/max price constraints from the strategy
-  if (strategy.minPrice && newPrice < strategy.minPrice) {
-    newPrice = strategy.minPrice;
+  // Apply listing-level min/max price constraints
+  if (listingMinPrice !== null && newPrice < listingMinPrice) {
+    newPrice = listingMinPrice;
   }
-  if (strategy.maxPrice && newPrice > strategy.maxPrice) {
-    newPrice = strategy.maxPrice;
+
+  if (listingMaxPrice !== null && newPrice > listingMaxPrice) {
+    newPrice = listingMaxPrice;
   }
 
   // Enhanced logic for STAY_ABOVE strategy with max price optimization
-  if (strategy.repricingRule === 'STAY_ABOVE' && strategy.maxPrice) {
+  if (
+    strategy.repricingRule === 'STAY_ABOVE' &&
+    listingMaxPrice !== null
+  ) {
     const calculatedPrice =
       strategy.stayAboveBy === 'AMOUNT'
         ? competitorPrice + (strategy.value || 0)
         : competitorPrice + competitorPrice * (strategy.value || 0);
 
     // If calculated price is significantly lower than max price, use max price
-    if (strategy.maxPrice - calculatedPrice >= 2) {
-      newPrice = strategy.maxPrice;
+    if (listingMaxPrice - calculatedPrice >= 2) {
+      newPrice = listingMaxPrice;
     }
   }
 
@@ -707,8 +734,20 @@ async function executePricingStrategy(itemId, strategy) {
       };
     }
 
-    // Calculate new price based on strategy
-    const newPrice = calculateNewPrice(strategy, competitorPrice, currentPrice);
+    // Get listing specific min and max prices
+    const { default: Product } = await import('../models/Product.js');
+    const productDoc = await Product.findOne({ itemId });
+    const listingMin = productDoc?.minPrice ?? null;
+    const listingMax = productDoc?.maxPrice ?? null;
+
+    // Calculate new price based on strategy and listing limits
+    const newPrice = calculateNewPrice(
+      strategy,
+      competitorPrice,
+      currentPrice,
+      listingMin,
+      listingMax
+    );
 
     // ENHANCED: More precise price change detection
     const priceChangeAmount = Math.abs(newPrice - currentPrice);
@@ -995,8 +1034,6 @@ export async function applyStrategiesToItem(itemId, strategyIds, sku = null) {
         success: true,
         strategyName: strategy.strategyName,
         repricingRule: strategy.repricingRule,
-        minPrice: strategy.minPrice,
-        maxPrice: strategy.maxPrice,
         message: `Strategy ${strategy.strategyName} applied successfully`,
       });
     } catch (error) {
@@ -1021,6 +1058,12 @@ export async function getStrategyDisplayForProduct(itemId, sku = null) {
     // Get strategies applied to this item
     const strategies = await getStrategiesForItem(itemId, sku);
 
+    const { default: Product } = await import('../models/Product.js');
+    const productDoc = await Product.findOne({ itemId });
+
+    const listingMin = productDoc?.minPrice ?? null;
+    const listingMax = productDoc?.maxPrice ?? null;
+
     if (!strategies || strategies.length === 0) {
       return {
         strategy: 'Assign Strategy',
@@ -1043,16 +1086,12 @@ export async function getStrategyDisplayForProduct(itemId, sku = null) {
     return {
       strategy: primaryStrategy.strategyName,
       minPrice:
-        appliesToEntry &&
-        appliesToEntry.minPrice !== undefined &&
-        appliesToEntry.minPrice !== null
-          ? `$${parseFloat(appliesToEntry.minPrice).toFixed(2)}`
+        listingMin !== null
+          ? `$${parseFloat(listingMin).toFixed(2)}`
           : 'Set',
       maxPrice:
-        appliesToEntry &&
-        appliesToEntry.maxPrice !== undefined &&
-        appliesToEntry.maxPrice !== null
-          ? `$${parseFloat(appliesToEntry.maxPrice).toFixed(2)}`
+        listingMax !== null
+          ? `$${parseFloat(listingMax).toFixed(2)}`
           : 'Set',
       hasStrategy: true,
       appliedStrategies: strategies,
@@ -1064,8 +1103,8 @@ export async function getStrategyDisplayForProduct(itemId, sku = null) {
       stayAboveBy: primaryStrategy.stayAboveBy,
       rawStrategy: {
         ...primaryStrategy.toObject(),
-        minPrice: appliesToEntry?.minPrice,
-        maxPrice: appliesToEntry?.maxPrice,
+        minPrice: listingMin,
+        maxPrice: listingMax,
       },
     };
   } catch (error) {

@@ -12,6 +12,9 @@ const ProductSchema = new mongoose.Schema({
     ref: 'CompetitorRule',
   },
   strategy: { type: mongoose.Schema.Types.ObjectId, ref: 'PricingStrategy' },
+  // Listing specific price limits
+  minPrice: { type: Number, default: null },
+  maxPrice: { type: Number, default: null },
   createdAt: { type: Date, default: Date.now },
 });
 
