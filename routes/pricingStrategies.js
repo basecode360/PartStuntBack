@@ -544,13 +544,26 @@ router.post('/products/:itemId/apply', async (req, res) => {
       });
     }
 
-    // Apply strategy with listing-specific prices
-    await strategy.applyToItem(
-      itemId,
-      sku || null,
-      title || null,
-      minPrice || null,
-      maxPrice || null
+    // Apply strategy to item
+    await strategy.applyToItem(itemId, sku || null, title || null);
+
+    // Update listing pricing separately
+    const { default: Product } = await import('../models/Product.js');
+    await Product.findOneAndUpdate(
+      { itemId },
+      {
+        $set: {
+          minPrice:
+            minPrice !== undefined && minPrice !== null
+              ? parseFloat(minPrice)
+              : null,
+          maxPrice:
+            maxPrice !== undefined && maxPrice !== null
+              ? parseFloat(maxPrice)
+              : null,
+        },
+      },
+      { new: true, upsert: false }
     );
 
     return res.status(200).json({
