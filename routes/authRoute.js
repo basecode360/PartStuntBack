@@ -21,35 +21,42 @@ import {
 
 const router = express.Router();
 
+// Validate eBay credentials at startup
+if (
+  !process.env.CLIENT_ID ||
+  !process.env.CLIENT_SECRET ||
+  !process.env.REDIRECT_URI
+) {
+  console.error('❌ Missing required eBay OAuth environment variables:');
+  console.error('CLIENT_ID:', !!process.env.CLIENT_ID);
+  console.error('CLIENT_SECRET:', !!process.env.CLIENT_SECRET);
+  console.error('REDIRECT_URI:', !!process.env.REDIRECT_URI);
+  throw new Error('Missing eBay OAuth environment variables');
+}
+
+console.log('✅ eBay OAuth environment variables loaded:', {
+  CLIENT_ID: process.env.CLIENT_ID?.substring(0, 10) + '...',
+  CLIENT_SECRET: process.env.CLIENT_SECRET?.substring(0, 10) + '...',
+  REDIRECT_URI: process.env.REDIRECT_URI,
+});
+
 // ── Token Management ────────────────────────────────────────────────────────────
 
 const tokenManager = {
   tokens: { accessToken: null, refreshToken: null, expiryTime: null },
 
-  init() {
-    this.tokens.accessToken = process.env.AUTH_TOKEN || null;
-    this.tokens.refreshToken = process.env.REFRESH_TOKEN || null;
-    // If you stored expiry in ENV
-    this.tokens.expiryTime = process.env.AUTH_TOKEN_EXPIRY
-      ? new Date(process.env.AUTH_TOKEN_EXPIRY)
+  init(user) {
+    this.tokens.accessToken = user?.ebay?.accessToken || null;
+    this.tokens.refreshToken = user?.ebay?.refreshToken || null;
+    this.tokens.expiryTime = user?.ebay?.expiresAt
+      ? new Date(user.ebay.expiresAt)
       : null;
-    console.log(
-      'Token manager initialized:',
-      this.tokens.accessToken ? '[accessToken exists]' : '[no accessToken]',
-      this.tokens.refreshToken ? '[refreshToken exists]' : ''
-    );
   },
 
   updateTokens(accessToken, refreshToken, expiresIn) {
     this.tokens.accessToken = accessToken;
     if (refreshToken) this.tokens.refreshToken = refreshToken;
     this.tokens.expiryTime = new Date(Date.now() + expiresIn * 1000);
-
-    process.env.AUTH_TOKEN = accessToken;
-    if (refreshToken) process.env.REFRESH_TOKEN = refreshToken;
-    process.env.AUTH_TOKEN_EXPIRY = this.tokens.expiryTime.toISOString();
-
-    console.log('Tokens updated; new expiry:', this.tokens.expiryTime);
   },
 
   isTokenValid() {
@@ -59,8 +66,6 @@ const tokenManager = {
     return this.tokens.expiryTime > fiveMinutesLater;
   },
 };
-
-tokenManager.init();
 
 // ─── Health check or placeholder ───────────────────────────────────
 router.get('/', (req, res) => {
@@ -187,8 +192,91 @@ router.get('/ebay-login', (req, res) => {
     `&scope=${scopes}` +
     `&state=${userId}`;
 
-  console.log('Redirecting to eBay login:', authUrl);
   res.redirect(authUrl);
+});
+
+// Step 2: Handle eBay OAuth callback (updated to match frontend route)
+router.get('/popup-callback', (req, res) => {
+  const { code, state: userId, error } = req.query;
+
+  console.log('🔄 eBay popup callback received:', {
+    hasCode: !!code,
+    userId,
+    error,
+    fullUrl: req.url,
+  });
+
+  if (error) {
+    console.error('eBay OAuth error:', error);
+    return res.send(`
+      <html>
+        <body>
+          <script>
+            if (window.opener) {
+              window.opener.postMessage({
+                error: '${error}',
+                userId: '${userId}'
+              }, 'https://17autoparts.com');
+              window.close();
+            } else {
+              document.body.innerHTML = '<h2>Error: ${error}</h2><p>Please close this window and try again.</p>';
+            }
+          </script>
+        </body>
+      </html>
+    `);
+  }
+
+  if (!code || !userId) {
+    console.error('Missing code or userId:', { code: !!code, userId });
+    return res.send(`
+      <html>
+        <body>
+          <script>
+            if (window.opener) {
+              window.opener.postMessage({
+                error: 'Missing authorization code or user ID',
+                userId: '${userId}'
+              }, 'https://17autoparts.com');
+              window.close();
+            } else {
+              document.body.innerHTML = '<h2>Error: Missing authorization code</h2><p>Please close this window and try again.</p>';
+            }
+          </script>
+        </body>
+      </html>
+    `);
+  }
+
+  console.log('✅ Sending code to parent window for user:', userId);
+
+  // Send the code back to the parent window
+  res.send(`
+    <html>
+      <body>
+        <script>
+          console.log('📨 Sending message to parent with code');
+          if (window.opener) {
+            window.opener.postMessage({
+              code: '${code}',
+              state: '${userId}'
+            }, 'https://17autoparts.com');
+            console.log('✅ Message sent, closing popup');
+            window.close();
+          } else {
+            document.body.innerHTML = '<h2>Authorization successful!</h2><p>Please close this window.</p>';
+          }
+        </script>
+      </body>
+    </html>
+  `);
+});
+
+// Keep the old route for backwards compatibility
+router.get('/ebay-callback', (req, res) => {
+  // Redirect to the new route
+  const queryString = new URLSearchParams(req.query).toString();
+  res.redirect(`/auth/popup-callback?${queryString}`);
 });
 
 // (Optional) Step 2: "Generate a code automatically" for testing
@@ -212,40 +300,65 @@ router.get('/automated-login', async (req, res) => {
 });
 
 // ─── POST /auth/exchange-code ─────────────────────────────────────
-// Body: { code: string, userId: string }
-// Exchanges an eBay OAuth "authorization code" for user‐specific access/refresh tokens.
-// Stores the resulting tokens under User.ebay.* fields.
 router.post('/exchange-code', async (req, res) => {
   try {
     const { code, userId } = req.body;
-    console.log('[Backend] Received code:', code, 'userId:', userId);
+
+    console.log('🔄 Exchange code request received:', {
+      hasCode: !!code,
+      codeLength: code?.length,
+      userId,
+      timestamp: new Date().toISOString(),
+    });
 
     if (!code || !userId) {
+      console.error('❌ Missing required parameters:', {
+        hasCode: !!code,
+        hasUserId: !!userId,
+      });
       return sendResponse(res, 400, false, 'Both code and userId are required');
     }
 
     // Verify user exists
     const user = await User.findById(userId);
     if (!user) {
+      console.error('❌ User not found:', userId);
       return sendResponse(res, 404, false, 'User not found');
     }
 
+    console.log('✅ User found, proceeding with token exchange...');
+    console.log('🔧 Environment check before calling service:', {
+      CLIENT_ID: !!process.env.CLIENT_ID,
+      CLIENT_SECRET: !!process.env.CLIENT_SECRET,
+      REDIRECT_URI: !!process.env.REDIRECT_URI,
+    });
+
     // Call our helper to exchange code ↠ tokens and save them on user.ebay.*
     const tokens = await exchangeCodeForToken(code, userId);
-    // exchangeCodeForToken() itself updates User.ebay.accessToken, refreshToken, expiresAt.
+
+    console.log('✅ Exchange successful, tokens saved for user:', userId);
 
     return sendResponse(res, 200, true, 'Tokens exchanged successfully', {
       access_token: tokens.access_token,
       refresh_token: tokens.refresh_token,
       expires_in: tokens.expires_in,
+      user_id: userId,
     });
   } catch (err) {
-    console.error('POST /auth/exchange-code error:', err);
+    console.error('❌ POST /auth/exchange-code error:', {
+      message: err.message,
+      response: err.response?.data,
+      status: err.response?.status,
+      stack: err.stack,
+    });
+
     return sendResponse(
       res,
       err.response?.status || 500,
       false,
-      err.message || 'Failed to exchange code'
+      err.response?.data?.error_description ||
+        err.message ||
+        'Failed to exchange code'
     );
   }
 });
@@ -411,6 +524,45 @@ router.get('/refresh', async (req, res) => {
         auth_url: '/auth/ebay-login',
       });
     }
+  }
+});
+
+// ─── POST /auth/ebay-logout ─────────────────────────────────────────
+// Clear eBay tokens from user's account in MongoDB
+router.post('/ebay-logout', async (req, res) => {
+  try {
+    const { userId } = req.body;
+
+    if (!userId) {
+      return sendResponse(res, 400, false, 'userId is required');
+    }
+
+    // Verify user exists
+    const user = await User.findById(userId);
+    if (!user) {
+      return sendResponse(res, 404, false, 'User not found');
+    }
+
+    // Clear eBay tokens from the user document
+    await User.findByIdAndUpdate(userId, {
+      $unset: {
+        'ebay.accessToken': 1,
+        'ebay.refreshToken': 1,
+        'ebay.expiresAt': 1,
+      },
+    });
+
+    return sendResponse(
+      res,
+      200,
+      true,
+      'eBay account disconnected successfully'
+    );
+  } catch (err) {
+    console.error('POST /auth/ebay-logout error:', err);
+    return sendResponse(res, 500, false, 'Failed to disconnect eBay account', {
+      error: err.message,
+    });
   }
 });
 

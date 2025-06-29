@@ -8,7 +8,15 @@ import { fetchEbayListings } from '../services/ebayService.js';
  */
 const getEbayListings = async (req, res) => {
   try {
-    const listings = await fetchEbayListings();
+    const userId = req.user?.id || req.query.userId;
+    if (!userId) {
+      return res
+        .status(401)
+        .json({ success: false, message: 'Unauthorized: userId required' });
+    }
+
+    const listings = await fetchEbayListings(userId); // ✅ pass it here
+
     return res.status(200).json({
       success: true,
       data: listings,

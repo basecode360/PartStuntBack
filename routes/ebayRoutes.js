@@ -4,7 +4,8 @@ import axios from 'axios';
 import ebayService from '../services/ebayService.js';
 import getEbayListings from '../controllers/ebayController.js';
 import fetchProducts from '../services/getInventory.js';
-import editRoute from '../services/editProduct.js';
+import editProductService from '../services/editProduct.js';
+import User from '../models/Users.js';
 
 const router = express.Router();
 
@@ -50,28 +51,6 @@ async function makeEBayAPICall(xmlRequest, callName) {
 
 // ── Routes ──────────────────────────────────────────────────────────────────────
 
-/**
- ** @swagger
- * /active-listings:
- *   get:
- *     description: Get all active selling listings from your eBay inventory
- *     responses:
- *       200:
- *         description: A list of active selling listings
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                 listings:
- *                   type: array
- *                   items:
- *                     type: object
- *       500:
- *         description: Internal server error
- */
 router.get('/active-listings', fetchProducts.getActiveListings);
 
 /**
@@ -80,7 +59,25 @@ router.get('/active-listings', fetchProducts.getActiveListings);
 router.get('/competitor-prices/:itemId', async (req, res) => {
   try {
     const { itemId } = req.params;
-    const oauthToken = process.env.AUTH_TOKEN; // Trading API
+    const { userId } = req.query;
+
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        message: 'userId is required in query parameters',
+      });
+    }
+
+    // Get user's eBay token
+    const user = await User.findById(userId);
+    if (!user || !user.ebay.accessToken) {
+      return res.status(400).json({
+        success: false,
+        message: 'No eBay credentials found for this user',
+      });
+    }
+
+    const oauthToken = user.ebay.accessToken;
     const appId = process.env.CLIENT_ID; // Browse API
 
     if (!oauthToken) {
@@ -124,7 +121,7 @@ router.get('/competitor-prices/:itemId', async (req, res) => {
       `https://api.ebay.com/buy/browse/v1/item_summary/search?${query.toString()}`,
       {
         headers: {
-          Authorization: `Bearer ${appId}`,
+          Authorization: `Bearer ${oauthToken}`, // Fixed to use oauthToken
           'Content-Type': 'application/json',
         },
         timeout: 10000,
@@ -186,17 +183,20 @@ router.get('/active-listingsviaFeed', fetchProducts.getActiveListingsViaFeed);
 /**
  * Get item variations for a specific item
  */
-router.get('/item-variations/:itemId', editRoute.getItemVariations);
+router.get('/item-variations/:itemId', editProductService.getItemVariations);
 
 /**
  * Edit variation price for a specific variation
  */
-router.post('/edit-variation-price', editRoute.editVariationPrice);
+router.post('/edit-variation-price', editProductService.editVariationPrice);
 
 /**
  * Edit all variations prices for an item
  */
-router.post('/edit-all-variations-price', editRoute.editAllVariationsPrices);
+router.post(
+  '/edit-all-variations-price',
+  editProductService.editAllVariationsPrices
+);
 
 /**
  * Get item details by ID
@@ -204,14 +204,25 @@ router.post('/edit-all-variations-price', editRoute.editAllVariationsPrices);
 router.get('/item/:itemId', async (req, res) => {
   try {
     const { itemId } = req.params;
-    const authToken = process.env.AUTH_TOKEN;
+    const { userId } = req.query;
 
-    if (!authToken) {
+    if (!userId) {
       return res.status(400).json({
         success: false,
-        message: 'eBay auth token is required',
+        message: 'userId is required in query parameters',
       });
     }
+
+    // Get user's eBay token
+    const user = await User.findById(userId);
+    if (!user || !user.ebay.accessToken) {
+      return res.status(400).json({
+        success: false,
+        message: 'No eBay credentials found for this user',
+      });
+    }
+
+    const authToken = user.ebay.accessToken;
 
     const xmlRequest = `
       <?xml version="1.0" encoding="utf-8"?>
@@ -260,7 +271,5 @@ router.get('/item/:itemId', async (req, res) => {
     });
   }
 });
-
-
 
 export default router;
