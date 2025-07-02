@@ -1,303 +1,293 @@
 import cron from 'node-cron';
+import { executeStrategyForItem } from './strategyService.js';
+import { refreshManualCompetitorPrices } from './inventoryService.js';
 
-/**
- * Service to automatically monitor competitor prices and execute strategies
- */
+class CompetitorMonitoringService {
+  constructor() {
+    this.isRunning = false;
+    this.lastRunTime = null;
+    this.minInterval = 10 * 60 * 1000; // Minimum 10 minutes between runs
+    this.maxConcurrentChecks = 3; // Limit concurrent API calls
+    this.checkQueue = [];
+    this.activeChecks = 0;
+  }
 
-/**
- * Update competitor prices and trigger strategies when prices change
- */
-export async function updateCompetitorPrices() {
-  try {
-
-    const { default: ManualCompetitor } = await import(
-      '../models/ManualCompetitor.js'
-    );
-    const { default: User } = await import('../models/Users.js');
-
-    // Get all manual competitors with monitoring enabled
-    const allCompetitorDocs = await ManualCompetitor.find({
-      monitoringEnabled: true,
-    }).populate('userId');
-
-    let totalUpdated = 0;
-    let totalChecked = 0;
-    let strategiesTriggered = 0;
-
-    for (const doc of allCompetitorDocs) {
-      try {
-        // Get user's eBay credentials
-        const user = await User.findById(doc.userId);
-        if (!user?.ebay?.accessToken) {
-          console.warn(`⚠️ No eBay credentials for user ${doc.userId}`);
-          continue;
-        }
-
-        // Only execute strategies based on existing competitor data
-
-        const strategyResult = await triggerStrategyForItem(
-          doc.itemId,
-          doc.userId
-        );
-
-        if (strategyResult.success) {
-          strategiesTriggered++;
-        }
-
-        // Update last monitoring check
-        doc.lastMonitoringCheck = new Date();
-        await doc.save();
-
-        // Add delay to avoid rate limiting
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      } catch (itemError) {
-        console.error(`Error processing item ${doc.itemId}:`, itemError);
-      }
+  async updateCompetitorPrices() {
+    // Prevent multiple simultaneous runs
+    if (this.isRunning) {
+      console.log('⏸️ Competitor monitoring already running, skipping...');
+      return {
+        success: false,
+        message: 'Monitoring already in progress',
+        lastRunTime: this.lastRunTime,
+      };
     }
 
-    return { totalChecked, totalUpdated, strategiesTriggered };
-  } catch (error) {
-    console.error('❌ Error in updateCompetitorPrices:', error);
-    throw error;
-  }
-}
-
-/**
- * Trigger strategy execution for a specific item
- */
-export async function triggerStrategyForItem(itemId, userId) {
-  try {
-
-    const { executeStrategiesForItem } = await import('./strategyService.js');
-    const result = await executeStrategiesForItem(itemId, userId);
-
-    return result;
-  } catch (error) {
-    return { success: false, error: error.message };
-  }
-}
-
-/**
- * Execute strategies for all items with competitors
- */
-export async function executeStrategiesForAllItems() {
-  try {
-    const { default: ManualCompetitor } = await import(
-      '../models/ManualCompetitor.js'
-    );
-
-    const allItems = await ManualCompetitor.find({
-      'competitors.0': { $exists: true },
-    });
-
-    let strategiesExecuted = 0;
-    let priceChanges = 0;
-
-    for (const item of allItems) {
-      try {
-        const result = await triggerStrategyForItem(item.itemId, item.userId);
-
-        if (result.success) {
-          strategiesExecuted++;
-          if (result.priceChanges > 0) {
-            priceChanges += result.priceChanges;
-          }
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, 500));
-      } catch (error) {
-        console.error(`❌ Error executing strategy for ${item.itemId}:`, error);
-      }
+    // Enforce minimum interval
+    if (this.lastRunTime && Date.now() - this.lastRunTime < this.minInterval) {
+      const timeLeft = Math.ceil(
+        (this.minInterval - (Date.now() - this.lastRunTime)) / 1000
+      );
+      console.log(
+        `⏸️ Too soon to run monitoring again. Wait ${timeLeft} seconds.`
+      );
+      return {
+        success: false,
+        message: `Please wait ${timeLeft} seconds before next run`,
+        lastRunTime: this.lastRunTime,
+      };
     }
 
-    return {
-      success: true,
-      strategiesExecuted,
-      priceChanges,
-      totalItems: allItems.length,
-    };
-  } catch (error) {
-    console.error('❌ Error in executeStrategiesForAllItems:', error);
-    return { success: false, error: error.message };
-  }
-}
+    this.isRunning = true;
+    this.lastRunTime = Date.now();
 
-/**
- * Start the automated monitoring system
- */
-export function startCompetitorMonitoring() {
-
-  // Run every 20 minutes
-  cron.schedule('*/20 * * * *', async () => {
     try {
-      await updateCompetitorPrices();
-    } catch (error) {
-      console.error('❌ Error in scheduled competitor monitoring:', error);
-    }
-  });
+      console.log('🔄 Starting competitor price monitoring...');
 
-}
-
-/**
- * Manual trigger for immediate strategy execution
- */
-// export async function manualCompetitorUpdate(itemId = null) {
-//   try {
-//     if (itemId) {
-//       const { default: ManualCompetitor } = await import(
-//         '../models/ManualCompetitor.js'
-//       );
-//       const doc = await ManualCompetitor.findOne({ itemId });
-
-//       if (doc) {
-//         const result = await triggerStrategyForItem(itemId, doc.userId);
-//         return { success: true, result };
-//       } else {
-//         return { success: false, error: 'Item not found' };
-//       }
-//     } else {
-//       const result = await executeStrategiesForAllItems();
-//       return { success: true, result };
-//     }
-//   } catch (error) {
-//     return { success: false, error: error.message };
-//   }
-// }
-
-/**
- * Execute strategies for all items with competitors (page load trigger)
- * IMPORTANT: This should NOT change competitor prices, only execute strategies
- */
-// export async function executeStrategiesForAllItems() {
-//   try {
-//     console.log('🚀 Executing strategies for all items with competitors...');
-
-//     const { default: ManualCompetitor } = await import(
-//       '../models/ManualCompetitor.js'
-//     );
-
-//     const allItems = await ManualCompetitor.find({
-//       'competitors.0': { $exists: true },
-//     });
-
-//     let strategiesExecuted = 0;
-//     let priceChanges = 0;
-
-//     // FIXED: Add rate limiting to prevent version conflicts
-//     const BATCH_SIZE = 3; // Process 3 items at a time
-//     const DELAY_BETWEEN_BATCHES = 2000; // 2 second delay between batches
-
-//     for (let i = 0; i < allItems.length; i += BATCH_SIZE) {
-//       const batch = allItems.slice(i, i + BATCH_SIZE);
-
-//       console.log(
-//         `📦 Processing batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(
-//           allItems.length / BATCH_SIZE
-//         )} (${batch.length} items)`
-//       );
-
-//       // Process batch in parallel but limit concurrency
-//       const batchPromises = batch.map(async (item, index) => {
-//         try {
-//           // Add staggered delay within batch to reduce conflicts
-//           await new Promise((resolve) => setTimeout(resolve, index * 500));
-
-//           console.log(`🔄 Executing strategy for ${item.itemId}...`);
-
-//           const result = await triggerStrategyForItem(item.itemId, item.userId);
-
-//           if (result.success) {
-//             strategiesExecuted++;
-//             if (result.priceChanges > 0) {
-//               priceChanges += result.priceChanges;
-//               console.log(`💰 Price updated for ${item.itemId}`);
-//             }
-//           }
-
-//           return { success: true, itemId: item.itemId };
-//         } catch (error) {
-//           console.error(
-//             `❌ Error executing strategy for ${item.itemId}:`,
-//             error
-//           );
-//           return { success: false, itemId: item.itemId, error: error.message };
-//         }
-//       });
-
-//       await Promise.all(batchPromises);
-
-//       // Wait between batches to prevent overwhelming the system
-//       if (i + BATCH_SIZE < allItems.length) {
-//         console.log(
-//           `⏳ Waiting ${DELAY_BETWEEN_BATCHES}ms before next batch...`
-//         );
-//         await new Promise((resolve) =>
-//           setTimeout(resolve, DELAY_BETWEEN_BATCHES)
-//         );
-//       }
-//     }
-
-//     console.log(
-//       `✅ Strategy execution completed: ${strategiesExecuted} strategies executed, ${priceChanges} price changes`
-//     );
-
-//     return {
-//       success: true,
-//       strategiesExecuted,
-//       priceChanges,
-//       totalItems: allItems.length,
-//     };
-//   } catch (error) {
-//     console.error('❌ Error in executeStrategiesForAllItems:', error);
-//     return { success: false, error: error.message };
-//   }
-// }
-
-/**
- * Start the automated monitoring system
- */
-// export function startCompetitorMonitoring() {
-//   console.log('🚀 Starting real competitor monitoring service...');
-
-//   // Run every 60 minutes to check for REAL competitor price changes
-//   cron.schedule('0 */1 * * *', async () => {
-//     try {
-//       console.log('⏰ Running scheduled REAL competitor price check...');
-//       await updateCompetitorPrices();
-//     } catch (error) {
-//       console.error('❌ Error in scheduled competitor monitoring:', error);
-//     }
-//   });
-
-//   console.log(
-//     '✅ Real competitor monitoring service started - checking every 60 minutes'
-//   );
-// }
-
-/**
- * Manual trigger for immediate competitor check and strategy execution
- */
-export async function manualCompetitorUpdate(itemId = null) {
-  try {
-    if (itemId) {
-      // Update specific item
       const { default: ManualCompetitor } = await import(
         '../models/ManualCompetitor.js'
       );
-      const doc = await ManualCompetitor.findOne({ itemId });
 
-      if (doc) {
-        const result = await triggerStrategyForItem(itemId, doc.userId);
-        return { success: true, result };
-      } else {
-        return { success: false, error: 'Item not found' };
+      // Get items with monitoring enabled and rate limit them
+      const itemsToCheck = await ManualCompetitor.find({
+        monitoringEnabled: true,
+        competitors: { $exists: true, $not: { $size: 0 } },
+      }).limit(20); // Limit to 20 items maximum per run
+
+      if (itemsToCheck.length === 0) {
+        console.log('📭 No items with competitor monitoring enabled');
+        return {
+          success: true,
+          message: 'No items to monitor',
+          checkedItems: 0,
+        };
       }
-    } else {
-      // Update all items with REAL price checking
-      const result = await updateCompetitorPrices();
-      return { success: true, result };
+
+      console.log(
+        `📊 Found ${itemsToCheck.length} items to check (limited to prevent API overuse)`
+      );
+
+      let checkedItems = 0;
+      let updatedItems = 0;
+      let errors = 0;
+
+      // Process items with rate limiting
+      for (const item of itemsToCheck) {
+        try {
+          // Wait for available slot
+          while (this.activeChecks >= this.maxConcurrentChecks) {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
+
+          this.activeChecks++;
+
+          const result = await this.checkItemCompetitors(item);
+
+          if (result.success) {
+            checkedItems++;
+            if (result.priceChanged) {
+              updatedItems++;
+            }
+          } else {
+            errors++;
+          }
+
+          // Add delay between checks to prevent rate limiting
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+        } catch (error) {
+          console.error(
+            `❌ Error checking item ${item.itemId}:`,
+            error.message
+          );
+          errors++;
+        } finally {
+          this.activeChecks--;
+        }
+      }
+
+      console.log(
+        `✅ Competitor monitoring completed: ${checkedItems} checked, ${updatedItems} updated, ${errors} errors`
+      );
+
+      return {
+        success: true,
+        message: 'Competitor monitoring completed',
+        checkedItems,
+        updatedItems,
+        errors,
+        timestamp: new Date().toISOString(),
+      };
+    } catch (error) {
+      console.error('❌ Competitor monitoring failed:', error);
+      return {
+        success: false,
+        message: error.message,
+        timestamp: new Date().toISOString(),
+      };
+    } finally {
+      this.isRunning = false;
     }
-  } catch (error) {
-    return { success: false, error: error.message };
+  }
+
+  async checkItemCompetitors(item) {
+    try {
+      // Rate limit check - don't check same item too frequently
+      const timeSinceLastCheck = item.lastMonitoringCheck
+        ? Date.now() - new Date(item.lastMonitoringCheck).getTime()
+        : Infinity;
+
+      const minCheckInterval = item.monitoringFrequency * 60 * 1000; // Convert minutes to ms
+
+      if (timeSinceLastCheck < minCheckInterval) {
+        console.log(
+          `⏭️ Skipping ${item.itemId} - checked ${Math.round(
+            timeSinceLastCheck / 60000
+          )} minutes ago`
+        );
+        return { success: true, priceChanged: false, reason: 'too_recent' };
+      }
+
+      console.log(`🔍 Checking competitors for item ${item.itemId}...`);
+
+      // Update last check time BEFORE making API calls to prevent concurrent checks
+      item.lastMonitoringCheck = new Date();
+      await item.save();
+
+      // Get current competitor prices (this may call eBay GetItem API)
+      const { getCompetitorPrice } = await import(
+        './competitorPriceService.js'
+      );
+      const currentLowestPrice = await getCompetitorPrice(
+        item.itemId,
+        null,
+        item.userId
+      );
+
+      if (currentLowestPrice && currentLowestPrice !== item.lastLowestPrice) {
+        console.log(
+          `💰 Price change detected for ${item.itemId}: ${item.lastLowestPrice} → ${currentLowestPrice}`
+        );
+
+        item.lastLowestPrice = currentLowestPrice;
+        await item.save();
+
+        // Execute strategy if price changed
+        const { executeStrategyForItem } = await import('./strategyService.js');
+        await executeStrategyForItem(item.itemId, item.userId);
+
+        return {
+          success: true,
+          priceChanged: true,
+          newPrice: currentLowestPrice,
+        };
+      }
+
+      return {
+        success: true,
+        priceChanged: false,
+        currentPrice: currentLowestPrice,
+      };
+    } catch (error) {
+      console.error(
+        `❌ Error checking competitors for ${item.itemId}:`,
+        error.message
+      );
+      return { success: false, error: error.message };
+    }
+  }
+
+  // Add method to manually stop monitoring
+  stopMonitoring() {
+    this.isRunning = false;
+    console.log('🛑 Competitor monitoring stopped manually');
+  }
+
+  // Get monitoring status
+  getStatus() {
+    return {
+      isRunning: this.isRunning,
+      lastRunTime: this.lastRunTime,
+      activeChecks: this.activeChecks,
+      queueLength: this.checkQueue.length,
+      nextAllowedRun: this.lastRunTime
+        ? new Date(this.lastRunTime + this.minInterval)
+        : new Date(),
+    };
   }
 }
+
+// Create a default instance
+const defaultService = new CompetitorMonitoringService();
+
+// Export the method from the default instance
+export const updateCompetitorPrices = () =>
+  defaultService.updateCompetitorPrices();
+
+// Export other methods
+export const checkItemCompetitors = (item) =>
+  defaultService.checkItemCompetitors(item);
+export const getMonitoringStatus = () => defaultService.getStatus();
+export const stopMonitoring = () => defaultService.stopMonitoring();
+
+// Export the class for direct instantiation if needed
+export { CompetitorMonitoringService };
+
+export function startCompetitorMonitoring() {
+  // CHANGE: From every 20 seconds to every 2 hours
+  cron.schedule('0 */2 * * *', async () => {
+    console.log('⏱ [monitor] running competitor price check (every 2 hours)…');
+    const service = new CompetitorMonitoringService();
+    await service.updateCompetitorPrices();
+  });
+
+  console.log('✅ Competitor monitoring scheduled to run every 2 hours');
+}
+
+// Add method to stop monitoring completely
+export function stopCompetitorMonitoring() {
+  // Stop all cron jobs
+  const jobs = cron.getTasks();
+  jobs.forEach((task, name) => {
+    task.stop();
+    console.log(`🛑 Stopped cron job: ${name}`);
+  });
+  console.log('🛑 All competitor monitoring stopped');
+}
+
+// Emergency stop function
+export function emergencyStopMonitoring() {
+  console.log('🚨 EMERGENCY STOP: Halting all competitor monitoring');
+  const jobs = cron.getTasks();
+  jobs.forEach((task) => {
+    task.destroy();
+  });
+
+  // Also clear any running intervals
+  if (global.competitorMonitoringInterval) {
+    clearInterval(global.competitorMonitoringInterval);
+    global.competitorMonitoringInterval = null;
+  }
+
+  console.log('🛑 Emergency stop completed');
+}
+
+// Add additional strategy execution functions
+export const triggerStrategyForItem = async (itemId, userId) => {
+  try {
+    const { executeStrategyForItem } = await import('./strategyService.js');
+    return await executeStrategyForItem(itemId, userId);
+  } catch (error) {
+    console.error(`❌ Error executing strategy for ${itemId}:`, error);
+    return { success: false, error: error.message };
+  }
+};
+
+export const executeStrategiesForAllItems = async () => {
+  try {
+    const { executeAllActiveStrategies } = await import('./strategyService.js');
+    return await executeAllActiveStrategies();
+  } catch (error) {
+    console.error('❌ Error executing all strategies:', error);
+    return { success: false, error: error.message };
+  }
+};

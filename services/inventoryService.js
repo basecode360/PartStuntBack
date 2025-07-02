@@ -1,89 +1,194 @@
 // services/inventoryService.js
-
 import axios from 'axios';
 import xml2js from 'xml2js';
 import User from '../models/Users.js';
+import Product from '../models/Product.js';
+import ManualCompetitor from '../models/ManualCompetitor.js';
+
+/**
+ * Fetch the live price of any eBay item using Trading API GetItem
+ */
+async function fetchEbayListingPrice(itemId, authToken) {
+  const xml = `<?xml version="1.0" encoding="utf-8"?>
+    <GetItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+      <RequesterCredentials>
+        <eBayAuthToken>${authToken}</eBayAuthToken>
+      </RequesterCredentials>
+      <ItemID>${itemId}</ItemID>
+      <DetailLevel>ReturnAll</DetailLevel>
+    </GetItemRequest>`;
+  const endpoint =
+    process.env.NODE_ENV === 'production'
+      ? 'https://api.ebay.com/ws/api.dll'
+      : 'https://api.sandbox.ebay.com/ws/api.dll';
+
+  const res = await axios.post(endpoint, xml, {
+    headers: {
+      'Content-Type': 'text/xml',
+      'X-EBAY-API-CALL-NAME': 'GetItem',
+      'X-EBAY-API-SITEID': '0',
+      'X-EBAY-API-COMPATIBILITY-LEVEL': '1155',
+    },
+  });
+  const parser = new xml2js.Parser({ explicitArray: false, ignoreAttrs: true });
+  const { Item } =
+    (await parser.parseStringPromise(res.data)).GetItemResponse || {};
+
+  // try BuyItNowPrice, then StartPrice, then CurrentPrice
+  const priceNode =
+    Item?.BuyItNowPrice ||
+    Item?.StartPrice ||
+    Item?.SellingStatus?.CurrentPrice;
+
+  if (!priceNode) throw new Error('No price found on eBay response');
+  return parseFloat(priceNode.Value || priceNode);
+}
+
+/**
+ * Refresh _all_ manual competitor prices for a given listing in Mongo _before_
+ * you compute lowest or alarm your repricer.
+ */
+export async function refreshManualCompetitorPrices(itemId, userId) {
+  console.log(`🔄 [refresh] called for ${itemId} / user ${userId}`);
+  const doc = await ManualCompetitor.findOne({ userId, itemId });
+  if (!doc) return;
+
+  // 1) get fresh OAuth token
+  const { access_token: token } = await getValidTokenForUser(userId);
+
+  // 2) XML parser
+  const parser = new xml2js.Parser({
+    explicitArray: false,
+    ignoreAttrs: false,
+  });
+
+  let changed = false;
+
+  for (let comp of doc.competitors) {
+    try {
+      // 3) ask eBay for that competitor item
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+        <GetItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+          <RequesterCredentials>
+            <eBayAuthToken>${token}</eBayAuthToken>
+          </RequesterCredentials>
+          <ItemID>${comp.competitorItemId}</ItemID>
+          <DetailLevel>ReturnAll</DetailLevel>
+        </GetItemRequest>`;
+
+      const endpoint =
+        process.env.NODE_ENV === 'production'
+          ? 'https://api.ebay.com/ws/api.dll'
+          : 'https://api.sandbox.ebay.com/ws/api.dll';
+
+      const resp = await axios.post(endpoint, xml, {
+        headers: {
+          'Content-Type': 'text/xml',
+          'X-EBAY-API-CALL-NAME': 'GetItem',
+          'X-EBAY-API-SITEID': '0',
+          'X-EBAY-API-COMPATIBILITY-LEVEL': '1155',
+        },
+      });
+
+      // 4) parse
+      const result = await parser.parseStringPromise(resp.data);
+      const item = result.GetItemResponse?.Item;
+      if (!item) continue;
+
+      // 5) drill into SellingStatus.CurrentPrice
+      const cp = item.SellingStatus?.CurrentPrice;
+      // sometimes price is in cp._ or cp.__value__ or cp._
+      let newPrice = null;
+      if (cp) {
+        newPrice =
+          parseFloat(cp._) ||
+          parseFloat(cp.__value__) ||
+          parseFloat(cp.Value) ||
+          NaN;
+      }
+
+      // fallback to StartPrice or BuyItNowPrice
+      if ((!newPrice || isNaN(newPrice)) && item.StartPrice) {
+        newPrice = parseFloat(
+          item.StartPrice._ ||
+            item.StartPrice.__value__ ||
+            item.StartPrice.Value
+        );
+      }
+      if ((!newPrice || isNaN(newPrice)) && item.BuyItNowPrice) {
+        newPrice = parseFloat(
+          item.BuyItNowPrice._ ||
+            item.BuyItNowPrice.__value__ ||
+            item.BuyItNowPrice.Value
+        );
+      }
+
+      // 6) if it’s a real number, and different than we've stored, overwrite
+      if (!isNaN(newPrice) && newPrice > 0 && comp.price !== newPrice) {
+        comp.price = newPrice;
+        changed = true;
+      }
+    } catch (err) {
+      console.warn(
+        `Failed to refresh price for competitor ${comp.competitorItemId}:`,
+        err.message
+      );
+    }
+  }
+
+  if (changed) {
+    await doc.save();
+    console.log(`🔄 Manual competitor prices updated for ${itemId}`);
+  }
+}
 
 /**
  * Get competitor prices for a specific item
- * @param {String} itemId - The eBay item ID
- * @param {String} userId - The user ID (optional)
+ * (now with live refresh baked in)
  */
 export async function getCompetitorPrice(itemId, userId = null) {
-  try {
-    console.log(`🔍 Getting competitor price for item ${itemId}`);
+  const ManualCompetitor = (await import('../models/ManualCompetitor.js'))
+    .default;
 
-    // First, try to get manually added competitors from MongoDB
-    const userId_actual =
-      userId || process.env.DEFAULT_USER_ID || '68430c2b0e746fb6c6ef1a7a';
-
-    try {
-      // Get manually added competitors
-      const { default: ManualCompetitor } = await import(
-        '../models/ManualCompetitor.js'
-      );
-
-      const manualCompetitorDoc = await ManualCompetitor.findOne({
-        userId: userId_actual,
-        itemId,
-      });
-
-      if (manualCompetitorDoc && manualCompetitorDoc.competitors.length > 0) {
-        // Extract prices from manual competitors - USE STORED PRICES ONLY
-        const prices = manualCompetitorDoc.competitors
-          .map((comp) => {
-            const price = parseFloat(comp.price);
-            return isNaN(price) ? null : price;
-          })
-          .filter((price) => price !== null && price > 0);
-
-        if (prices.length > 0) {
-          const lowestPrice = Math.min(...prices);
-          console.log(
-            `📊 Found ${prices.length} manual competitor prices, lowest: ${lowestPrice}`
-          );
-
-          return {
-            success: true,
-            price: lowestPrice.toFixed(2),
-            count: prices.length,
-            allPrices: prices,
-            productInfo: manualCompetitorDoc.competitors,
-            source: 'manual_competitors',
-          };
-        }
-      }
-    } catch (mongoError) {
-      console.warn(
-        'Failed to get manual competitors from MongoDB:',
-        mongoError.message
-      );
-    }
-
-    // If no manual competitors, return no competition
-    console.log(`⚠️ No manual competitors found for ${itemId}`);
-
-    return {
-      success: false,
-      price: '0.00',
-      count: 0,
-      allPrices: [],
-      productInfo: [],
-      source: 'no_competitors',
-      message: 'No competitors found',
-    };
-  } catch (error) {
-    console.error(`❌ Error getting competitor price for ${itemId}:`, error);
-    return {
-      success: false,
-      price: '0.00',
-      count: 0,
-      allPrices: [],
-      productInfo: [],
-      error: error.message,
-      source: 'error',
-    };
+  // determine actual userId
+  const uid = userId || process.env.DEFAULT_USER_ID;
+  if (!uid) {
+    throw new Error('No userId provided or defaulted');
   }
+
+  // 1) Pull live prices for every manual competitor
+  await refreshManualCompetitorPrices(itemId, uid);
+
+  // 2) Re-fetch the doc (with updated prices)
+  const doc = await ManualCompetitor.findOne({ itemId, userId: uid });
+  if (doc?.competitors?.length) {
+    const prices = doc.competitors
+      .map((c) => parseFloat(c.price))
+      .filter((p) => !isNaN(p) && p > 0);
+
+    if (prices.length) {
+      const lowest = Math.min(...prices);
+      return {
+        success: true,
+        price: lowest.toFixed(2),
+        count: prices.length,
+        allPrices: prices,
+        productInfo: doc.competitors,
+        source: 'manual_competitors',
+      };
+    }
+  }
+
+  // fallback if no manual
+  return {
+    success: false,
+    price: '0.00',
+    count: 0,
+    allPrices: [],
+    productInfo: [],
+    source: 'no_competitors',
+    message: 'No manual competitors found',
+  };
 }
 
 /**
@@ -100,9 +205,8 @@ function getUpdatedPrice(itemId, sku) {
  */
 export async function getActiveListings(userId = null) {
   try {
-    // Get user ID from parameter or try to find it
+    // Always require userId
     const targetUserId = userId || process.env.DEFAULT_USER_ID;
-
     if (!targetUserId) {
       throw new Error('User ID is required for fetching eBay listings');
     }
@@ -168,7 +272,7 @@ export async function getActiveListings(userId = null) {
 export async function updateEbayPrice(itemId, sku, newPrice, userId = null) {
   try {
     console.log(
-      `🔄 [INVENTORY] Attempting to update eBay price for ${itemId} to $${newPrice}`
+      `🔄 [INVENTORY] Attempting to update eBay price for ${itemId} to $${newPrice} (sku: ${sku}, userId: ${userId})`
     );
 
     // Get user with eBay credentials
@@ -233,327 +337,56 @@ export async function updateEbayPrice(itemId, sku, newPrice, userId = null) {
       }
     }
 
-    const authToken = user.ebay.accessToken;
-
-    // First try to get current price to verify the change
-    let currentPriceBeforeUpdate = null;
-    try {
-      const currentPriceResult = await getCurrentEbayPrice(itemId);
-      if (currentPriceResult) {
-        currentPriceBeforeUpdate = currentPriceResult;
-        console.log(
-          `📊 Current price before update: $${currentPriceBeforeUpdate}`
-        );
-      }
-    } catch (priceError) {
+    // --- Inventory API logic starts here ---
+    const product = await Product.findOne({ itemId, userId: user._id });
+    const offerId = product && product.offerId;
+    if (!offerId) {
       console.warn(
-        'Could not get current price before update:',
-        priceError.message
+        `[INVENTORY] No offerId for ${itemId}, falling back to Trading API`
       );
-    }
-
-    // First try to get item details to check if it uses SKU management
-    const getItemRequest = `<?xml version="1.0" encoding="utf-8"?>
-<GetItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-  <RequesterCredentials>
-    <eBayAuthToken>${authToken}</eBayAuthToken>
-  </RequesterCredentials>
-  <ItemID>${itemId}</ItemID>
-  <OutputSelector>Item.InventoryTrackingMethod</OutputSelector>
-  <OutputSelector>Item.SKU</OutputSelector>
-</GetItemRequest>`;
-
-    const ebayUrl =
-      process.env.NODE_ENV === 'production'
-        ? 'https://api.ebay.com/ws/api.dll'
-        : 'https://api.sandbox.ebay.com/ws/api.dll';
-
-    console.log(`🔍 Checking item details for ${itemId}...`);
-
-    try {
-      const getItemResponse = await axios({
-        method: 'POST',
-        url: ebayUrl,
-        headers: {
-          'Content-Type': 'text/xml',
-          'X-EBAY-API-CALL-NAME': 'GetItem',
-          'X-EBAY-API-SITEID': '0',
-          'X-EBAY-API-COMPATIBILITY-LEVEL': '1119',
-          'X-EBAY-API-APP-NAME': process.env.CLIENT_ID,
-        },
-        data: getItemRequest,
-      });
-
-      const parser = new xml2js.Parser({
-        explicitArray: false,
-        ignoreAttrs: true,
-      });
-
-      const getItemResult = await new Promise((resolve, reject) => {
-        parser.parseString(getItemResponse.data, (err, result) => {
-          if (err) reject(err);
-          else resolve(result);
-        });
-      });
-
-      const itemDetails = getItemResult.GetItemResponse;
-      const inventoryMethod = itemDetails?.Item?.InventoryTrackingMethod;
-      const itemSku = itemDetails?.Item?.SKU;
-
-      console.log(`📋 Item ${itemId} details:`, {
-        inventoryMethod,
-        itemSku,
-        usesSKU: inventoryMethod === 'SKU',
-      });
-
-      // Use ReviseFixedPriceItem for non-SKU managed items or if no valid SKU
-      if (inventoryMethod !== 'SKU' || !itemSku) {
-        console.log(
-          `🔄 Using ReviseFixedPriceItem for ${itemId} (no SKU management)`
-        );
-
-        const reviseItemRequest = `<?xml version="1.0" encoding="utf-8"?>
-<ReviseFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-  <RequesterCredentials>
-    <eBayAuthToken>${authToken}</eBayAuthToken>
-  </RequesterCredentials>
-  <Item>
-    <ItemID>${itemId}</ItemID>
-    <StartPrice>${newPrice}</StartPrice>
-  </Item>
-</ReviseFixedPriceItemRequest>`;
-
-        const reviseResponse = await axios({
-          method: 'POST',
-          url: ebayUrl,
-          headers: {
-            'Content-Type': 'text/xml',
-            'X-EBAY-API-CALL-NAME': 'ReviseFixedPriceItem',
-            'X-EBAY-API-SITEID': '0',
-            'X-EBAY-API-COMPATIBILITY-LEVEL': '1119',
-            'X-EBAY-API-APP-NAME': process.env.CLIENT_ID,
-          },
-          data: reviseItemRequest,
-        });
-
-        const reviseResult = await new Promise((resolve, reject) => {
-          parser.parseString(reviseResponse.data, (err, result) => {
-            if (err) reject(err);
-            else resolve(result);
-          });
-        });
-
-        const reviseResponseData = reviseResult.ReviseFixedPriceItemResponse;
-
-        if (
-          reviseResponseData.Ack === 'Success' ||
-          reviseResponseData.Ack === 'Warning'
-        ) {
-          console.log(
-            `✅ [INVENTORY] eBay price update successful for ${itemId} using ReviseFixedPriceItem`
-          );
-
-          // Verify the actual price change occurred
-          let actualPriceChangeConfirmed = false;
-          if (currentPriceBeforeUpdate) {
-            const priceChange = Math.abs(newPrice - currentPriceBeforeUpdate);
-            actualPriceChangeConfirmed = priceChange >= 0.01;
-            console.log(
-              `📊 Price change verification: $${currentPriceBeforeUpdate} → $${newPrice} (change: $${priceChange.toFixed(
-                2
-              )}, confirmed: ${actualPriceChangeConfirmed})`
-            );
-          }
-
-          return {
-            success: true,
-            itemId,
-            oldPrice: currentPriceBeforeUpdate,
-            newPrice,
-            priceChangeConfirmed: actualPriceChangeConfirmed,
-            message:
-              'Price updated successfully on eBay via ReviseFixedPriceItem',
-            ebayResponse: reviseResponseData,
-            timestamp: new Date(),
-            method: 'ReviseFixedPriceItem',
-          };
-        } else {
-          throw new Error(
-            reviseResponseData.Errors?.LongMessage ||
-              'ReviseFixedPriceItem failed'
-          );
-        }
-
-        return {
-          success: true,
-          itemId,
-          newPrice,
-          message:
-            'Price updated successfully on eBay via ReviseFixedPriceItem',
-          ebayResponse: reviseResponseData,
-          timestamp: new Date(),
-          method: 'ReviseFixedPriceItem',
-        };
-      } else {
-        // Use ReviseInventoryStatus for SKU-managed items
-        console.log(
-          `🔄 Using ReviseInventoryStatus for ${itemId} with SKU: ${itemSku}`
-        );
-
-        const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
-<ReviseInventoryStatusRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-  <RequesterCredentials>
-    <eBayAuthToken>${authToken}</eBayAuthToken>
-  </RequesterCredentials>
-  <InventoryStatus>
-    <ItemID>${itemId}</ItemID>
-    <SKU>${itemSku}</SKU>
-    <StartPrice>${newPrice}</StartPrice>
-  </InventoryStatus>
-</ReviseInventoryStatusRequest>`;
-
-        const response = await axios({
-          method: 'POST',
-          url: ebayUrl,
-          headers: {
-            'Content-Type': 'text/xml',
-            'X-EBAY-API-CALL-NAME': 'ReviseInventoryStatus',
-            'X-EBAY-API-SITEID': '0',
-            'X-EBAY-API-COMPATIBILITY-LEVEL': '1119',
-            'X-EBAY-API-APP-NAME': process.env.CLIENT_ID,
-          },
-          data: xmlRequest,
-        });
-
-        const result = await new Promise((resolve, reject) => {
-          parser.parseString(response.data, (err, result) => {
-            if (err) reject(err);
-            else resolve(result);
-          });
-        });
-
-        const reviseResponse = result.ReviseInventoryStatusResponse;
-
-        if (
-          reviseResponse.Ack === 'Success' ||
-          reviseResponse.Ack === 'Warning'
-        ) {
-          console.log(
-            `✅ eBay price update successful for ${itemId} using ReviseInventoryStatus`
-          );
-
-          // Don't record price history here - let the strategy service handle it
-        } else {
-          throw new Error(
-            reviseResponse.Errors?.LongMessage || 'ReviseInventoryStatus failed'
-          );
-        }
-
-        return {
-          success: true,
-          itemId,
-          newPrice,
-          message:
-            'Price updated successfully on eBay via ReviseInventoryStatus',
-          ebayResponse: reviseResponse,
-          timestamp: new Date(),
-          method: 'ReviseInventoryStatus',
-        };
-      }
-    } catch (getItemError) {
-      console.warn(
-        `⚠️ Could not get item details for ${itemId}, trying ReviseFixedPriceItem as fallback:`,
-        getItemError.message
+      // Fallback to Trading API ReviseFixedPriceItem
+      const result = await reviseViaTradingAPI(
+        itemId,
+        newPrice,
+        user.ebay.accessToken
       );
-
-      // Fallback to ReviseFixedPriceItem if GetItem fails
-      const reviseItemRequest = `<?xml version="1.0" encoding="utf-8"?>
-<ReviseFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-  <RequesterCredentials>
-    <eBayAuthToken>${authToken}</eBayAuthToken>
-  </RequesterCredentials>
-  <Item>
-    <ItemID>${itemId}</ItemID>
-    <StartPrice>${newPrice}</StartPrice>
-  </Item>
-</ReviseFixedPriceItemRequest>`;
-
-      const reviseResponse = await axios({
-        method: 'POST',
-        url: ebayUrl,
-        headers: {
-          'Content-Type': 'text/xml',
-          'X-EBAY-API-CALL-NAME': 'ReviseFixedPriceItem',
-          'X-EBAY-API-SITEID': '0',
-          'X-EBAY-API-COMPATIBILITY-LEVEL': '1119',
-          'X-EBAY-API-APP-NAME': process.env.CLIENT_ID,
-        },
-        data: reviseItemRequest,
-      });
-
-      const parser = new xml2js.Parser({
-        explicitArray: false,
-        ignoreAttrs: true,
-      });
-
-      const reviseResult = await new Promise((resolve, reject) => {
-        parser.parseString(reviseResponse.data, (err, result) => {
-          if (err) reject(err);
-          else resolve(result);
-        });
-      });
-
-      const reviseResponseData = reviseResult.ReviseFixedPriceItemResponse;
-
-      if (
-        reviseResponseData.Ack === 'Success' ||
-        reviseResponseData.Ack === 'Warning'
-      ) {
+      if (result.success) {
         console.log(
-          `✅ eBay price update successful for ${itemId} using fallback ReviseFixedPriceItem`
+          `✅ Trading API price update successful for item ${itemId}`
         );
-
-        // Don't record price history here - let the strategy service handle it
-
-        return {
-          success: true,
-          itemId,
-          newPrice,
-          message:
-            'Price updated successfully on eBay via fallback ReviseFixedPriceItem',
-          ebayResponse: reviseResponseData,
-          timestamp: new Date(),
-          method: 'ReviseFixedPriceItem_fallback',
-        };
       } else {
         console.error(
-          `❌ eBay API returned error for ${itemId}:`,
-          reviseResponseData
+          `❌ Trading API price update failed for item ${itemId}:`,
+          result.error
         );
-
-        // Check for token expiry specifically
-        if (reviseResponseData.Errors?.ErrorCode === '932') {
-          return {
-            success: false,
-            itemId,
-            newPrice,
-            message:
-              'eBay authentication token expired - please re-authenticate',
-            error: 'Invalid eBay token',
-            requiresReauth: true,
-          };
-        }
-
-        return {
-          success: false,
-          itemId,
-          newPrice,
-          message: 'eBay API error',
-          error: reviseResponseData.Errors?.LongMessage || 'Unknown eBay error',
-          ebayError: reviseResponseData.Errors,
-        };
       }
+      return result;
     }
+
+    const client = await getInventoryClient(user.ebay.accessToken);
+
+    console.log(`🔄 Inventory API: updating offer ${offerId} → $${newPrice}`);
+    const payload = {
+      pricingSummary: {
+        price: {
+          value: newPrice.toFixed(2),
+          currency: 'USD',
+        },
+      },
+    };
+
+    const resp = await client.patch(`/offer/${offerId}/update_price`, payload);
+
+    if (resp.status === 204) {
+      console.log(
+        `✅ Inventory API price update successful for offer ${offerId}`
+      );
+      return { success: true, itemId, newPrice, method: 'InventoryAPI' };
+    } else {
+      console.error(`❌ Inventory API error: ${resp.status}`);
+      throw new Error(`Inventory API error: ${resp.status}`);
+    }
+    // --- Inventory API logic ends here ---
   } catch (error) {
     console.error(`❌ Error updating eBay price for ${itemId}:`, error);
 
@@ -580,6 +413,44 @@ export async function updateEbayPrice(itemId, sku, newPrice, userId = null) {
 }
 
 /**
+ * Fallback: Revise price via Trading API if no offerId exists
+ */
+async function reviseViaTradingAPI(itemId, newPrice, authToken) {
+  const xml = `<?xml version="1.0" encoding="utf-8"?>
+    <ReviseFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+      <RequesterCredentials><eBayAuthToken>${authToken}</eBayAuthToken></RequesterCredentials>
+      <Item><ItemID>${itemId}</ItemID><StartPrice>${newPrice}</StartPrice></Item>
+    </ReviseFixedPriceItemRequest>`;
+  const url =
+    process.env.NODE_ENV === 'production'
+      ? 'https://api.ebay.com/ws/api.dll'
+      : 'https://api.sandbox.ebay.com/ws/api.dll';
+  const res = await axios.post(url, xml, {
+    headers: {
+      'Content-Type': 'text/xml',
+      'X-EBAY-API-CALL-NAME': 'ReviseFixedPriceItem',
+      'X-EBAY-API-SITEID': '0',
+      'X-EBAY-API-APP-NAME': process.env.CLIENT_ID,
+      'X-EBAY-API-COMPATIBILITY-LEVEL': '1119',
+    },
+  });
+  const parser = new xml2js.Parser({ explicitArray: false, ignoreAttrs: true });
+  const result = await parser.parseStringPromise(res.data);
+  const ack = result.ReviseFixedPriceItemResponse.Ack;
+  if (ack === 'Success' || ack === 'Warning') {
+    return {
+      success: true,
+      method: 'ReviseFixedPriceItem',
+      ebayResponse: result.ReviseFixedPriceItemResponse,
+    };
+  } else {
+    throw new Error(
+      result.ReviseFixedPriceItemResponse.Errors?.LongMessage || 'Unknown error'
+    );
+  }
+}
+
+/**
  * Monitor and sync price changes based on strategies
  * @param {String} itemId - The item to monitor
  * @param {String} userId - User ID for eBay credentials
@@ -587,9 +458,9 @@ export async function updateEbayPrice(itemId, sku, newPrice, userId = null) {
 export async function syncPriceWithStrategy(itemId, userId = null) {
   try {
     // Import strategy service to execute pricing logic
-    const { executeStrategiesForItem } = await import('./strategyService.js');
+    const { executeStrategyForItem } = await import('./strategyService.js');
 
-    const result = await executeStrategiesForItem(itemId);
+    const result = await executeStrategyForItem(itemId);
 
     return result;
   } catch (error) {
@@ -609,6 +480,15 @@ export async function syncPriceWithStrategy(itemId, userId = null) {
  */
 export async function getCurrentEbayPrice(itemId, sku = null, userId = null) {
   try {
+    // Always require userId
+    if (!userId) {
+      return {
+        success: false,
+        error: 'User ID is required for fetching current eBay price',
+        itemId,
+        sku,
+      };
+    }
     const listings = await getActiveListings(userId);
 
     if (listings.success && listings.data.GetMyeBaySellingResponse) {
@@ -801,4 +681,73 @@ async function ebayApiRequest(endpoint, options) {
     console.error('eBay API request failed:', error);
     throw error;
   }
+}
+
+/**
+ * Upsert eBay listings for an account
+ * @param {Array} listings - The list of listings to upsert
+ * @param {String} userId - The user ID
+ * @param {String} ebayAccountId - The eBay account ID
+ */
+async function upsertEbayListingsForAccount(listings, userId, ebayAccountId) {
+  const tokenData = await getValidTokenForUser(userId);
+  const token = tokenData.access_token;
+  const skus = [];
+
+  for (const item of listings) {
+    skus.push(item.SKU);
+    await Product.findOneAndUpdate(
+      { itemId: item.ItemID, ebayAccountId },
+      {
+        $set: {
+          userId,
+          ebayAccountId,
+          title: item.Title,
+          sku: item.SKU,
+          // offerId will be hydrated below
+          lastFetched: new Date(),
+        },
+      },
+      { upsert: true, new: true }
+    );
+  }
+
+  // after saving all Products, fetch & store their offerIds
+  await hydrateOfferIdsForSkus(
+    skus.filter((s) => s),
+    token
+  );
+}
+
+/**
+ * Given an array of SKUs, fetch their offerIds and write to Product.offerId
+ */
+async function hydrateOfferIdsForSkus(skus, userToken) {
+  if (!skus || skus.length === 0) return;
+  const client = await getInventoryClient(userToken);
+  const resp = await client.get('/offer', {
+    params: { sku: skus.join(',') },
+  });
+  if (resp.data && Array.isArray(resp.data.offers)) {
+    for (let offer of resp.data.offers) {
+      await Product.updateMany(
+        { sku: offer.sku },
+        { $set: { offerId: offer.offerId } }
+      );
+    }
+  }
+}
+
+/**
+ * Get Inventory API client
+ * @param {String} token - eBay access token
+ */
+async function getInventoryClient(token) {
+  return axios.create({
+    baseURL: 'https://api.ebay.com/sell/inventory/v1',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+  });
 }

@@ -1,7 +1,7 @@
 // routes/inventory.js
 
 import express from 'express';
-import { requireAuth } from '../controllers/middleware/authMiddleware.js';
+import { requireAuth } from '../middleware/authMiddleware.js';
 import Product from '../models/Product.js';
 import {
   getActiveListings,
@@ -19,7 +19,6 @@ router.post('/sync-price/:itemId', requireAuth, async (req, res) => {
   try {
     const { itemId } = req.params;
     const userId = req.user?.id;
-
 
     const result = await syncPriceWithStrategy(itemId, userId);
 
@@ -133,26 +132,37 @@ router.put('/pricing/:itemId', requireAuth, async (req, res) => {
 
     const update = {};
     if (minPrice !== undefined) {
-      update.minPrice = minPrice === null || minPrice === '' ? null : parseFloat(minPrice);
+      update.minPrice =
+        minPrice === null || minPrice === '' ? null : parseFloat(minPrice);
     }
     if (maxPrice !== undefined) {
-      update.maxPrice = maxPrice === null || maxPrice === '' ? null : parseFloat(maxPrice);
+      update.maxPrice =
+        maxPrice === null || maxPrice === '' ? null : parseFloat(maxPrice);
     }
 
-    const product = await Product.findOneAndUpdate({ itemId }, { $set: update }, { new: true });
-
-    if (!product) {
-      return res.status(404).json({ success: false, message: 'Product not found' });
-    }
+    // Always upsert (create if not exists)
+    const product = await Product.findOneAndUpdate(
+      { itemId },
+      { $set: update },
+      { new: true, upsert: true }
+    );
 
     return res.json({
       success: true,
       message: 'Listing pricing updated',
-      data: { itemId: product.itemId, minPrice: product.minPrice, maxPrice: product.maxPrice },
+      data: {
+        itemId: product.itemId,
+        minPrice: product.minPrice,
+        maxPrice: product.maxPrice,
+      },
     });
   } catch (error) {
     console.error('Error updating listing pricing:', error);
-    return res.status(500).json({ success: false, message: 'Error updating listing pricing', error: error.message });
+    return res.status(500).json({
+      success: false,
+      message: 'Error updating listing pricing',
+      error: error.message,
+    });
   }
 });
 
